@@ -472,6 +472,107 @@ class FOOOF(object):
 
         return deepcopy(self)
 
+    def learn_filters(self, fs):
+        """Learn zero-phase FIR amplifier using the Remez method based on the peaks"""
+        from scipy.signal import cheby1, cheby2
+        from mne.viz import plot_filter
+
+        nyquist = fs / 2
+
+        filter_coeffs, amplitudes, figs, ideal_gains = [], [], [], []
+
+        freqs = np.linspace(0, nyquist, 1000)
+
+        if self.background_mode == 'knee':
+            slope = self.background_params_[2]
+            knee = self.background_params_[1]
+        else:
+            slope = self.background_params_[1]
+            knee = 1.0
+
+        if knee < 0:
+            knee_frequency = 1**(1.0/float(slope)) + 1
+        else:
+            knee_frequency = knee**(1.0/float(slope)) + 1
+
+        offset = self.background_params_[0]
+
+        logarg = knee + freqs**slope
+        logarg[logarg < 0] = 1e-20
+
+        ideal_gain = np.log10(logarg)
+        ideal_gain = (((ideal_gain - np.min(ideal_gain)) / (np.max(ideal_gain) - np.min(ideal_gain))))**2
+        ideal_gain[logarg < 0] = 1e-20
+        ideal_gain = np.clip(ideal_gain, 1e-20, 1)
+
+        ideal_gains.append(ideal_gain)
+
+        print('highpass')
+        print(offset, knee, slope, knee_frequency)
+
+        critical = knee_frequency / nyquist
+
+        print('critical frequency:', critical)
+
+        coeffs = cheby1(1, np.sqrt(slope), critical, btype='highpass', analog=False)
+        iir_params = dict(b=coeffs[0], a=coeffs[1])
+
+        f = plot_filter(iir_params, fs, freq=freqs, gain=ideal_gain, color='#1f77b4', flim=[0, 10], fscale='linear', alim=(-60, 10), show=False)
+        f.set_figwidth(6)
+        f.set_figheight(12)
+        figs.append(f)
+
+        filter_coeffs.append(coeffs)
+        amplitudes.append(1-10**(2*offset/10))
+
+        # bandpass each of the peaks
+        for idx, ([centre_frequency, amplitude, std_dev]) in enumerate(self._gaussian_params):
+            # bandwidth = std * 6
+            # print('centre:', centre_frequency, 'amplitude:', amplitude, 'bandwidth:', bandwidth)
+            # mean_log = np.log(centre_frequency / (np.sqrt(1 + (std_dev**2) / centre_frequency**2)))
+
+            ideal_gain = (gaussian_function(freqs, *self._gaussian_params[idx, :]))
+            ideal_gain = ((ideal_gain - np.min(ideal_gain)) / (np.max(ideal_gain) - np.min(ideal_gain)))**2
+            ideal_gain = np.clip(ideal_gain, 1e-20, 1)
+
+            cummulative_ideal_gain = ideal_gain.cumsum() / ideal_gain.sum()
+            # print('Lorentz curve:', ideal_gain_lorentz)
+
+            critical_low = freqs[np.argmax(cummulative_ideal_gain > 0.003)] / nyquist
+            critical_high = freqs[np.argmax(cummulative_ideal_gain > 0.997)] / nyquist
+
+            # std_log = np.log(1 + (std_dev**2) / (centre_frequency**2))
+            # critical_low = np.exp(mean_log - 9*std_log*mean_log) / nyquist
+            # critical_high = np.exp(mean_log + 9*std_log*mean_log) / nyquist
+
+            print('critical frequencies:', critical_low, critical_high)
+
+            # low-pass filter if stopband would be negative
+            if critical_low <= 0:
+                coeffs = cheby2(3, 30, [critical_high], btype='lowpass', analog=False)
+            else:
+                # high-pass filter if critical frequency would be above Nyquist limit
+                if critical_high > 1:
+                    coeffs = cheby2(3, 30, [critical_high], btype='highpass', analog=False)
+                # regular case, band-pass approximate Gaussian
+                else:
+                    coeffs = cheby2(2, 30, [critical_low, critical_high], btype='bandpass', analog=False)
+
+            filter_coeffs.append(coeffs)
+            amplitudes.append(1+amplitude)
+
+            ideal_gains.append(ideal_gain)
+
+            iir_params = dict(b=coeffs[0], a=coeffs[1])
+            try:
+                f = plot_filter(iir_params, fs, freq=freqs, gain=ideal_gain, color='#1f77b4', flim=[0, 40], fscale='linear', alim=(-60, 10), show=False)
+                f.set_figwidth(6)
+                f.set_figheight(12)
+                figs.append(f)
+            except Exception as e:
+                print('PLOTTING FAIL:', e)
+
+        return filter_coeffs, amplitudes, figs, ideal_gains
 
     def _check_width_limits(self):
         """Check and warn about peak width limits / frequency resolution interaction."""
