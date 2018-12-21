@@ -475,13 +475,15 @@ class FOOOF(object):
     def learn_filters(self, fs):
         """Learn zero-phase FIR amplifier using the Remez method based on the peaks"""
         from scipy.signal import cheby1, cheby2
+        from scipy.special import gamma, gammainc, gammaincc
         from mne.viz import plot_filter
 
         nyquist = fs / 2
 
         filter_coeffs, amplitudes, figs, ideal_gains = [], [], [], []
 
-        freqs = np.linspace(0, nyquist, 1000)
+        freqs = np.linspace(0, nyquist, 10000, endpoint=True)
+        # logfreqs = np.logspace(-2, 0, 10000, endpoint=True, base=10)
 
         if self.background_mode == 'knee':
             slope = self.background_params_[2]
@@ -491,9 +493,7 @@ class FOOOF(object):
             knee = 1.0
 
         if knee < 0:
-            knee_frequency = 1**(1.0/float(slope)) + 1
-        else:
-            knee_frequency = knee**(1.0/float(slope)) + 1
+            knee = 1.0
 
         offset = self.background_params_[0]
 
@@ -501,71 +501,80 @@ class FOOOF(object):
         logarg[logarg < 0] = 1e-20
 
         ideal_gain = np.log10(logarg)
-        ideal_gain = (((ideal_gain - np.min(ideal_gain)) / (np.max(ideal_gain) - np.min(ideal_gain))))**2
+        ideal_gain = ((ideal_gain - np.min(ideal_gain)) / (np.max(ideal_gain) - np.min(ideal_gain)))
+        # ideal_gain = (ideal_gain / np.log10(512))**2
         ideal_gain[logarg < 0] = 1e-20
-        ideal_gain = np.clip(ideal_gain, 1e-20, 1)
+        ideal_gain = np.sqrt(np.clip(ideal_gain, 1e-20, 1))
 
         ideal_gains.append(ideal_gain)
 
-        print('highpass')
-        print(offset, knee, slope, knee_frequency)
+        print('offset, knee, slope, knee_f')
+        print(offset, self.background_params_[1], slope)
+        print('highpass 1/f removal')
 
-        critical = knee_frequency / nyquist
+        critical = (knee / nyquist)
 
-        print('critical frequency:', critical)
+        # print('critical frequency:', critical*nyquist)
 
-        coeffs = cheby1(1, np.sqrt(slope), critical, btype='highpass', analog=False)
+        coeffs = cheby1(1, (2*np.pi)*(slope**2), critical, btype='highpass', analog=False)
         iir_params = dict(b=coeffs[0], a=coeffs[1])
 
-        f = plot_filter(iir_params, fs, freq=freqs, gain=ideal_gain, color='#1f77b4', flim=[0, 10], fscale='linear', alim=(-60, 10), show=False)
-        f.set_figwidth(6)
-        f.set_figheight(12)
-        figs.append(f)
+        # print('coeffs:', coeffs)
+
+        try:
+            f = plot_filter(iir_params, fs, freq=freqs, gain=ideal_gain, color='#1f77b4', flim=[0, 10], fscale='linear', alim=(-60, 10), show=False)
+            f.set_figwidth(6)
+            f.set_figheight(12)
+            figs.append(f)
+        except:
+            print("ERRORRRR")
 
         filter_coeffs.append(coeffs)
-        amplitudes.append(1-10**(2*offset/10))
+        amplitudes.append(10**(offset/10))
 
         # bandpass each of the peaks
-        for idx, ([centre_frequency, amplitude, std_dev]) in enumerate(self._gaussian_params):
-            # bandwidth = std * 6
-            # print('centre:', centre_frequency, 'amplitude:', amplitude, 'bandwidth:', bandwidth)
-            # mean_log = np.log(centre_frequency / (np.sqrt(1 + (std_dev**2) / centre_frequency**2)))
+        for idx, ([centre_frequency, amplitude, bw]) in enumerate(self.get_results().peak_params):
+            std_dev = bw / 2
 
-            ideal_gain = (gaussian_function(freqs, *self._gaussian_params[idx, :]))
-            ideal_gain = ((ideal_gain - np.min(ideal_gain)) / (np.max(ideal_gain) - np.min(ideal_gain)))**2
-            ideal_gain = np.clip(ideal_gain, 1e-20, 1)
+            ideal_gain = ((1/(std_dev*np.sqrt(2*np.pi)))*np.exp(-(1/2)*(((freqs-centre_frequency)/std_dev)**2)))
+            ideal_gain = ((ideal_gain - np.min(ideal_gain)) / (np.max(ideal_gain) - np.min(ideal_gain)))
+            ideal_gain = np.sqrt(np.clip(ideal_gain, 1e-20, 1))
 
-            cummulative_ideal_gain = ideal_gain.cumsum() / ideal_gain.sum()
-            # print('Lorentz curve:', ideal_gain_lorentz)
+            ripple_db = 30
+            # ripple_factor = 1 / np.sqrt(10**(0.1*ripple_db)-1)
+            # print('ripple factor:', ripple_factor)
 
-            critical_low = freqs[np.argmax(cummulative_ideal_gain > 0.003)] / nyquist
-            critical_high = freqs[np.argmax(cummulative_ideal_gain > 0.997)] / nyquist
+            N = 2
 
-            # std_log = np.log(1 + (std_dev**2) / (centre_frequency**2))
-            # critical_low = np.exp(mean_log - 9*std_log*mean_log) / nyquist
-            # critical_high = np.exp(mean_log + 9*std_log*mean_log) / nyquist
+            critical_low = centre_frequency / nyquist - (3.3)*std_dev / nyquist
+            critical_high = centre_frequency / nyquist + (5)*std_dev / nyquist
 
-            print('critical frequencies:', critical_low, critical_high)
+            # critical_low = critical_low / (np.cos(np.pi / (2*N)))
+            # critical_high = critical_high / (np.cos(np.pi / (2*N)))
+
+            print('critical frequencies, centre:', critical_low*nyquist, critical_high*nyquist, centre_frequency)
 
             # low-pass filter if stopband would be negative
             if critical_low <= 0:
-                coeffs = cheby2(3, 30, [critical_high], btype='lowpass', analog=False)
+                coeffs = cheby2(N + 1, ripple_db, [critical_high], btype='lowpass')
             else:
                 # high-pass filter if critical frequency would be above Nyquist limit
                 if critical_high > 1:
-                    coeffs = cheby2(3, 30, [critical_high], btype='highpass', analog=False)
+                    coeffs = cheby2(N + 1, ripple_db, [critical_low], btype='highpass')
                 # regular case, band-pass approximate Gaussian
                 else:
-                    coeffs = cheby2(2, 30, [critical_low, critical_high], btype='bandpass', analog=False)
+                    coeffs = cheby2(N, ripple_db, [critical_low, critical_high], btype='bandpass')
+
+            # print('coeffs:', coeffs)
 
             filter_coeffs.append(coeffs)
-            amplitudes.append(1+amplitude)
+            amplitudes.append(amplitude)
 
             ideal_gains.append(ideal_gain)
 
             iir_params = dict(b=coeffs[0], a=coeffs[1])
             try:
-                f = plot_filter(iir_params, fs, freq=freqs, gain=ideal_gain, color='#1f77b4', flim=[0, 40], fscale='linear', alim=(-60, 10), show=False)
+                f = plot_filter(iir_params, fs, freq=np.hstack((0, freqs)), gain=np.hstack((1e-30, ideal_gain)), color='#1f77b4', flim=[0, 40], fscale='linear', alim=(-60, 10), show=False)
                 f.set_figwidth(6)
                 f.set_figheight(12)
                 figs.append(f)
